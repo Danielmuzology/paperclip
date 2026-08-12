@@ -141,7 +141,10 @@ describePg("linked-work completion worker", () => {
       },
       {
         fetchFn,
-        now: () => (clockReads++ === 0 ? claimedAt : expiredAt),
+        // processNext first performs its periodic recovery and then claims.
+        // Hold both phases at the claim instant; advance only when the
+        // authoritative preflight reaches its pre-send lease check.
+        now: () => (clockReads++ < 2 ? claimedAt : expiredAt),
       },
     );
 
