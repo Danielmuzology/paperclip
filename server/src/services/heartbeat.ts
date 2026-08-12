@@ -10,6 +10,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   MODEL_PROFILE_KEYS,
   envBindingSchema,
+  isAgentStatusInvokable,
   isEnvironmentDriverSupportedForAdapter,
   type BillingType,
   type EnvironmentLeaseStatus,
@@ -5205,6 +5206,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
           executionState: issues.executionState,
+          startedAt: issues.startedAt,
         })
         .from(issues)
         .where(and(eq(issues.id, input.issueId!), eq(issues.companyId, input.run.companyId)))
@@ -5300,7 +5302,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : null;
         if (
           !reviewer ||
-          ["terminated", "pending_approval"].includes(reviewer.status) ||
+          !isAgentStatusInvokable(reviewer.status) ||
           participant?.type !== "agent" ||
           participant.agentId !== reviewer.id
         ) {
@@ -5321,6 +5323,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // The bounded `nextAction` in resultJson drives the existing continuation
         // scheduler after this exact run reaches a successful terminal state.
         patch.status = "in_progress";
+        patch.startedAt = current.startedAt ?? new Date();
       }
       const updatedIssue = await tx
         .update(issues)
