@@ -85,13 +85,20 @@ export function createLinkedWorkCompletionWorker(
 
   async function processNext(): Promise<boolean> {
     if (stopped) return false;
-    const current = running ?? processOne();
+    const current = running ?? processCycle();
     running = current;
     try {
       return await current;
     } finally {
       if (running === current) running = undefined;
     }
+  }
+
+  async function processCycle(): Promise<boolean> {
+    // Recovery is part of every long-lived worker cycle, not only startup.
+    // processNext coalesces overlapping timer calls onto this same promise.
+    await recoverExpired();
+    return processOne();
   }
 
   async function processOne(): Promise<boolean> {

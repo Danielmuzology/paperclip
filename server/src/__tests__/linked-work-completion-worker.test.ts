@@ -255,6 +255,50 @@ describePg("linked-work completion worker", () => {
     ).toMatchObject({ status: "delivered", attemptCount: 2, leaseFence: 2 });
   });
 
+  it("recovers an expired processing row on a long-lived overlapping tick without restart", async () => {
+    let clock = new Date("2026-08-12T14:00:00.000Z");
+    const row = await seed({
+      status: "processing",
+      attemptCount: 1,
+      leaseFence: 1,
+      leaseOwner: "prior-cycle-owner",
+      leaseTokenHash: "b".repeat(64),
+      leaseExpiresAt: new Date(clock.getTime() + 30_000),
+      sendStarted: false,
+      nextAttemptAt: clock,
+    });
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(ack(row));
+    const worker = createLinkedWorkCompletionWorker(
+      db,
+      {
+        callbackUrl:
+          "https://origin.example.test/integrations/paperclip/linked-work/completion",
+        callbackSecret: "x".repeat(32),
+      },
+      { fetchFn, now: () => clock },
+    );
+
+    expect(await worker.processNext()).toBe(false);
+    expect(fetchFn).not.toHaveBeenCalled();
+
+    clock = new Date(clock.getTime() + 30_001);
+    const [firstTick, overlappingTick] = await Promise.all([
+      worker.processNext(),
+      worker.processNext(),
+    ]);
+    expect(firstTick).toBe(true);
+    expect(overlappingTick).toBe(true);
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(
+      (
+        await db
+          .select()
+          .from(linkedWorkCompletionOutbox)
+          .where(eq(linkedWorkCompletionOutbox.providerEventId, row.providerEventId))
+      )[0],
+    ).toMatchObject({ status: "delivered", attemptCount: 2, leaseFence: 2 });
+  });
+
   it("retries the same deterministic event after an ambiguous accept and after 429 backoff", async () => {
     let clock = new Date("2026-08-12T12:00:00.000Z");
     const row = await seed({ nextAttemptAt: clock });
