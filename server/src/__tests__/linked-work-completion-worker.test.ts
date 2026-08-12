@@ -136,7 +136,7 @@ describePg("linked-work completion worker", () => {
     const worker = createLinkedWorkCompletionWorker(db, { callbackUrl: "https://origin.example.test/integrations/paperclip/linked-work/completion", callbackSecret: "x".repeat(32) }, { fetchFn, now: () => clock });
     expect(await worker.processNext()).toBe(true);
     let durable = (await db.select().from(linkedWorkCompletionOutbox).where(eq(linkedWorkCompletionOutbox.providerEventId, row.providerEventId)))[0]!;
-    expect(durable).toMatchObject({ status: "pending", attemptCount: 1, lastErrorCode: "callback_outcome_ambiguous_retry" });
+    expect(durable).toMatchObject({ status: "pending", attemptCount: 1, lastErrorCode: "callback_transport_ambiguous" });
     expect(await worker.processNext()).toBe(false);
     clock = new Date(durable.nextAttemptAt.getTime() + 1);
     expect(await worker.processNext()).toBe(true);

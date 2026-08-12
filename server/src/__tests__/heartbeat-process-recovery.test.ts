@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { and, eq, or, inArray } from "drizzle-orm";
+import { and, eq, or, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -346,6 +346,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
+    // Production evidence is append-only and its no-delete trigger is itself
+    // exercised in the worker suite. This isolated shared-DB fixture must
+    // truncate the evidence table before deleting its referenced issues/runs.
+    await db.execute(sql`TRUNCATE TABLE ${linkedWorkCompletionOutbox}`);
     await db.delete(activityLog);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
