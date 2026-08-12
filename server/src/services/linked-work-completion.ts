@@ -12,6 +12,13 @@ import { paperclipAdapterDispositionEnvelopeSchema } from "../adapters/http/disp
 const leaseMs = 60_000;
 const responseLimitBytes = 64 * 1024;
 const requestTimeoutMs = 20_000;
+const requestLeaseSafetyMs = 5_000;
+
+if (leaseMs <= requestTimeoutMs + requestLeaseSafetyMs) {
+  throw new Error(
+    "Linked-work completion lease must exceed the callback timeout and safety margin.",
+  );
+}
 
 export interface LinkedWorkCompletionWorkerConfig {
   callbackUrl: string;
@@ -155,15 +162,29 @@ export function createLinkedWorkCompletionWorker(
       eq(linkedWorkCompletionOutbox.leaseFence, claimed.leaseFence),
       eq(linkedWorkCompletionOutbox.leaseTokenHash, tokenHash),
     );
-    const liveFence = (at: Date) =>
+    const claimedLiveFence = (at: Date) =>
       and(baseFence, gt(linkedWorkCompletionOutbox.leaseExpiresAt, at));
+    let renewedLeaseExpiresAt: Date | null = null;
+    const renewedLiveFence = (at: Date) => {
+      if (!renewedLeaseExpiresAt) {
+        return and(baseFence, sql`false`);
+      }
+      return and(
+        baseFence,
+        eq(
+          linkedWorkCompletionOutbox.leaseExpiresAt,
+          renewedLeaseExpiresAt,
+        ),
+        gt(linkedWorkCompletionOutbox.leaseExpiresAt, at),
+      );
+    };
     try {
       const authoritative = await loadAuthoritativeCompletion(db, claimed);
       if (!authoritative) {
         const transitionAt = now();
         await markManual(
           db,
-          liveFence(transitionAt),
+          claimedLiveFence(transitionAt),
           transitionAt,
           "completion_binding_mismatch",
           "Durable completion no longer matches the authoritative issue and run.",
@@ -171,19 +192,25 @@ export function createLinkedWorkCompletionWorker(
         return true;
       }
       const sendStartedAt = now();
+      const nextLeaseExpiresAt = new Date(sendStartedAt.getTime() + leaseMs);
       const marked = await db
         .update(linkedWorkCompletionOutbox)
-        .set({ sendStarted: true, updatedAt: sendStartedAt })
-        .where(liveFence(sendStartedAt))
+        .set({
+          sendStarted: true,
+          leaseExpiresAt: nextLeaseExpiresAt,
+          updatedAt: sendStartedAt,
+        })
+        .where(claimedLiveFence(sendStartedAt))
         .returning({ id: linkedWorkCompletionOutbox.providerEventId });
       if (marked.length !== 1) throw new Error("Completion delivery lease was lost.");
+      renewedLeaseExpiresAt = nextLeaseExpiresAt;
 
       const response = await postCallback(fetchFn, config, claimed);
       if (response.kind === "manual") {
         const transitionAt = now();
         await markManual(
           db,
-          liveFence(transitionAt),
+          renewedLiveFence(transitionAt),
           transitionAt,
           response.code,
           response.summary,
@@ -194,7 +221,7 @@ export function createLinkedWorkCompletionWorker(
         const transitionAt = now();
         await markRetry(
           db,
-          liveFence(transitionAt),
+          renewedLiveFence(transitionAt),
           claimed,
           transitionAt,
           response.code,
@@ -215,7 +242,7 @@ export function createLinkedWorkCompletionWorker(
           lastErrorCode: null,
           lastErrorSummary: null,
         })
-        .where(liveFence(deliveredAt))
+        .where(renewedLiveFence(deliveredAt))
         .returning({ id: linkedWorkCompletionOutbox.providerEventId });
       if (delivered.length !== 1) {
         throw new Error("Completion delivery acknowledgement lost its durable fence.");
@@ -226,7 +253,9 @@ export function createLinkedWorkCompletionWorker(
         const transitionAt = now();
         await markRetry(
           db,
-          liveFence(transitionAt),
+          renewedLeaseExpiresAt
+            ? renewedLiveFence(transitionAt)
+            : claimedLiveFence(transitionAt),
           claimed,
           transitionAt,
           "callback_outcome_ambiguous_retry",

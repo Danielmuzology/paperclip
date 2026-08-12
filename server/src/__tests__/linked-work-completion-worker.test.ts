@@ -183,6 +183,78 @@ describePg("linked-work completion worker", () => {
     ).toMatchObject({ status: "delivered", attemptCount: 2, leaseFence: 2 });
   });
 
+  it("renews the send lease across the bounded POST and fences the stale sender after recovery", async () => {
+    const claimedAt = new Date("2026-08-12T13:00:00.000Z");
+    const sendStartedAt = new Date(claimedAt.getTime() + 30_000);
+    let clock = claimedAt;
+    const row = await seed({ nextAttemptAt: claimedAt });
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockImplementationOnce(async () => {
+        await firstBlocked;
+        return ack(row);
+      })
+      .mockImplementationOnce(() => Promise.resolve(ack(row)));
+    let firstClockRead = true;
+    const first = createLinkedWorkCompletionWorker(
+      db,
+      {
+        callbackUrl:
+          "https://origin.example.test/integrations/paperclip/linked-work/completion",
+        callbackSecret: "x".repeat(32),
+      },
+      {
+        fetchFn,
+        now: () => {
+          if (firstClockRead) {
+            firstClockRead = false;
+            return claimedAt;
+          }
+          return clock === claimedAt ? sendStartedAt : clock;
+        },
+      },
+    );
+    const firstRun = first.processNext();
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledOnce());
+
+    // The original claim expired, but the atomic pre-send renewal still owns
+    // the row, so recovery and a contender cannot emit a duplicate POST.
+    clock = new Date(claimedAt.getTime() + 60_001);
+    const contender = createLinkedWorkCompletionWorker(
+      db,
+      {
+        callbackUrl:
+          "https://origin.example.test/integrations/paperclip/linked-work/completion",
+        callbackSecret: "x".repeat(32),
+      },
+      { fetchFn, now: () => clock },
+    );
+    expect(await contender.recoverExpired()).toEqual({ released: 0, quarantined: 0 });
+    expect(await contender.processNext()).toBe(false);
+    expect(fetchFn).toHaveBeenCalledOnce();
+
+    // After the renewed lease expires, recovery may replay the same
+    // deterministic provider event. The old sender cannot finalize over the
+    // successor fence even if its request later returns successfully.
+    clock = new Date(sendStartedAt.getTime() + 60_001);
+    expect(await contender.recoverExpired()).toEqual({ released: 1, quarantined: 0 });
+    expect(await contender.processNext()).toBe(true);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    releaseFirst();
+    expect(await firstRun).toBe(true);
+    expect(
+      (
+        await db
+          .select()
+          .from(linkedWorkCompletionOutbox)
+          .where(eq(linkedWorkCompletionOutbox.providerEventId, row.providerEventId))
+      )[0],
+    ).toMatchObject({ status: "delivered", attemptCount: 2, leaseFence: 2 });
+  });
+
   it("retries the same deterministic event after an ambiguous accept and after 429 backoff", async () => {
     let clock = new Date("2026-08-12T12:00:00.000Z");
     const row = await seed({ nextAttemptAt: clock });
