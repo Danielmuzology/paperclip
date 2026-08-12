@@ -956,25 +956,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await seedQueuedIssueRunFixture();
       const blockerIssueId = randomUUID();
       const reviewerAgentId = randomUUID();
-      if (kind === "blocked") {
-        await db.insert(issues).values({
-          id: blockerIssueId,
-          companyId,
-          title: "Governed blocker",
-          status: "in_progress",
-          priority: "medium",
-          assigneeAgentId: agentId,
-          issueNumber: 2,
-          identifier: `B-${blockerIssueId.slice(0, 8)}`,
-          startedAt: new Date(),
-        });
-        await db.insert(issueRelations).values({
-          companyId,
-          type: "blocks",
-          issueId: blockerIssueId,
-          relatedIssueId: issueId,
-        });
-      }
       if (kind === "in_review") {
         await db.insert(agents).values({
           id: reviewerAgentId,
@@ -1007,20 +988,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ...(kind === "blocked" ? { blockerIssueId } : {}),
         ...(kind === "in_review" ? { reviewerAgentId } : {}),
       };
-      mockAdapterExecute.mockResolvedValueOnce({
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        summary: disposition.summary,
-        resultJson: {
-          paperclipAdapterDisposition: {
-            schemaVersion: "paperclip.adapter-disposition.v1",
-            status: "completed",
-            binding: { runId, companyId, agentId, issueId },
-            disposition,
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        // A pre-existing unresolved blocker correctly prevents Paperclip from
+        // dispatching the run at all. Model the governed adapter discovering
+        // and recording a blocker during the active run instead, so the
+        // finalizer must prove that exact authoritative relation.
+        if (kind === "blocked") {
+          await db.insert(issues).values({
+            id: blockerIssueId,
+            companyId,
+            title: "Governed blocker",
+            status: "in_progress",
+            priority: "medium",
+            assigneeAgentId: agentId,
+            issueNumber: 2,
+            identifier: `B-${blockerIssueId.slice(0, 8)}`,
+            startedAt: new Date(),
+          });
+          await db.insert(issueRelations).values({
+            companyId,
+            type: "blocks",
+            issueId: blockerIssueId,
+            relatedIssueId: issueId,
+          });
+        }
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          summary: disposition.summary,
+          resultJson: {
+            paperclipAdapterDisposition: {
+              schemaVersion: "paperclip.adapter-disposition.v1",
+              status: "completed",
+              binding: { runId, companyId, agentId, issueId },
+              disposition,
+            },
+            ...(kind === "continue" ? { nextAction: disposition.summary } : {}),
           },
-          ...(kind === "continue" ? { nextAction: disposition.summary } : {}),
-        },
+        };
       });
       const heartbeat = heartbeatService(db);
 
