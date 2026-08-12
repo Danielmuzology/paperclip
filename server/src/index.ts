@@ -53,6 +53,7 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
+import { createLinkedWorkCompletionWorker } from "./services/linked-work-completion.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
@@ -641,6 +642,32 @@ export async function startServer(): Promise<StartedServer> {
     }
   };
   const pluginWorkerManager = createPluginWorkerManager();
+  const linkedWorkCompletionWorker =
+    config.linkedWorkCompletionCallbackUrl && config.linkedWorkCompletionCallbackSecret
+      ? createLinkedWorkCompletionWorker(db as any, {
+          callbackUrl: config.linkedWorkCompletionCallbackUrl,
+          callbackSecret: config.linkedWorkCompletionCallbackSecret,
+        })
+      : undefined;
+  let linkedWorkCompletionTimer: ReturnType<typeof setInterval> | undefined;
+  if (linkedWorkCompletionWorker) {
+    const recovered = await linkedWorkCompletionWorker.recoverExpired();
+    if (recovered.released > 0 || recovered.quarantined > 0) {
+      logger.warn(recovered, "Recovered linked-work completion delivery leases.");
+    }
+    const tick = async () => {
+      try {
+        while (await linkedWorkCompletionWorker.processNext()) {
+          // Drain serially; row leases fence another server process.
+        }
+      } catch (err) {
+        logger.error({ err }, "Linked-work completion worker tick failed.");
+      }
+    };
+    void tick();
+    linkedWorkCompletionTimer = setInterval(() => void tick(), 15_000);
+    linkedWorkCompletionTimer.unref();
+  }
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -774,7 +801,10 @@ export async function startServer(): Promise<StartedServer> {
   }
 
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const heartbeat = heartbeatService(db as any, {
+      pluginWorkerManager,
+      linkedWorkCompletionConfigured: Boolean(linkedWorkCompletionWorker),
+    });
     const routines = routineService(db as any, { pluginWorkerManager });
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
@@ -1039,6 +1069,8 @@ export async function startServer(): Promise<StartedServer> {
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      if (linkedWorkCompletionTimer) clearInterval(linkedWorkCompletionTimer);
+      await linkedWorkCompletionWorker?.stop();
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();

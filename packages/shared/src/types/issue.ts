@@ -449,6 +449,15 @@ export interface IssueExecutionPolicy {
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
+  linkedWorkCompletion?: {
+    schemaVersion: "cross-org-linked-work.target.v1";
+    linkedWorkId: string;
+    correlationId: string;
+    originCompanyId: string;
+    originIssueId: string;
+    targetCompanyId: string;
+    targetAgentId: string;
+  };
 }
 
 export interface IssueExecutionMonitorState {

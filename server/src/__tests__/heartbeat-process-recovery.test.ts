@@ -24,6 +24,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  linkedWorkCompletionOutbox,
   issueComments,
   issueDocuments,
   issuePlanDecompositions,
@@ -988,6 +989,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ...(kind === "blocked" ? { blockerIssueId } : {}),
         ...(kind === "in_review" ? { reviewerAgentId } : {}),
       };
+      const linkedWorkPolicy = kind === "done"
+        ? {
+            schemaVersion: "cross-org-linked-work.target.v1" as const,
+            linkedWorkId: `linked_work_${randomUUID()}`,
+            correlationId: `cross_org_${randomUUID()}`,
+            originCompanyId: randomUUID(),
+            originIssueId: randomUUID(),
+            targetCompanyId: companyId,
+            targetAgentId: agentId,
+          }
+        : null;
+      if (linkedWorkPolicy) {
+        await db.update(issues).set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+            linkedWorkCompletion: linkedWorkPolicy,
+          },
+        }).where(eq(issues.id, issueId));
+      }
       mockAdapterExecute.mockImplementationOnce(async () => {
         // A pre-existing unresolved blocker correctly prevents Paperclip from
         // dispatching the run at all. Model the governed adapter discovering
@@ -1028,7 +1050,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           },
         };
       });
-      const heartbeat = heartbeatService(db);
+      const heartbeat = heartbeatService(db, {
+        linkedWorkCompletionConfigured: kind === "done",
+      });
 
       await heartbeat.resumeQueuedRuns();
       const settled = await waitForRunToSettle(heartbeat, runId, 5_000);
@@ -1060,6 +1084,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         disposition: kind,
         evidenceSha256: "a".repeat(64),
       });
+      if (kind === "done") {
+        const outbox = await db.select().from(linkedWorkCompletionOutbox).where(eq(linkedWorkCompletionOutbox.issueId, issueId));
+        expect(outbox).toHaveLength(1);
+        expect(outbox[0]).toMatchObject({
+          companyId,
+          issueId,
+          agentId,
+          runId,
+          status: "pending",
+          attemptCount: 0,
+          linkedWorkId: linkedWorkPolicy?.linkedWorkId,
+          correlationId: linkedWorkPolicy?.correlationId,
+        });
+      }
 
       await heartbeat.resumeQueuedRuns();
       expect(
@@ -1131,6 +1169,46 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
     ).toHaveLength(0);
   });
+
+  it("rolls back a strict done disposition when completion delivery is not configured", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        linkedWorkCompletion: {
+          schemaVersion: "cross-org-linked-work.target.v1",
+          linkedWorkId: `linked_work_${randomUUID()}`,
+          correlationId: `cross_org_${randomUUID()}`,
+          originCompanyId: randomUUID(),
+          originIssueId: randomUUID(),
+          targetCompanyId: companyId,
+          targetAgentId: agentId,
+        },
+      },
+    }).where(eq(issues.id, issueId));
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "Must roll back without outbox readiness.",
+      resultJson: {
+        paperclipAdapterDisposition: {
+          schemaVersion: "paperclip.adapter-disposition.v1",
+          status: "completed",
+          binding: { runId, companyId, agentId, issueId },
+          disposition: { kind: "done", summary: "Must roll back.", evidenceSha256: "d".repeat(64) },
+        },
+      },
+    });
+    const heartbeat = heartbeatService(db, { linkedWorkCompletionConfigured: false });
+    await heartbeat.resumeQueuedRuns();
+    const settled = await waitForRunToSettle(heartbeat, runId, 5_000);
+    expect(settled?.status).toBe("failed");
+    expect(await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0])).toMatchObject({ status: "in_progress", executionRunId: runId });
+    expect(await db.select().from(linkedWorkCompletionOutbox).where(eq(linkedWorkCompletionOutbox.issueId, issueId))).toHaveLength(0);
+  }, 15_000);
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();

@@ -28,9 +28,15 @@ const sharedOpts = {
   singleLine: true,
 };
 
+export const httpSecretRedactionPaths = [
+  "req.headers.authorization",
+  "req.headers['x-paperclip-linked-work-control-secret']",
+  "req.headers['x-paperclip-webhook-secret']",
+] as const;
+
 export const logger = pino({
   level: "debug",
-  redact: ["req.headers.authorization"],
+  redact: [...httpSecretRedactionPaths],
 }, pino.transport({
   targets: [
     {

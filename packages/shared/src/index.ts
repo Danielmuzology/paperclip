@@ -1121,6 +1121,7 @@ export {
   issueBlockedInboxStateSchema,
   updateIssueSchema,
   issueExecutionPolicySchema,
+  linkedWorkCompletionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
   issueReviewRequestSchema,

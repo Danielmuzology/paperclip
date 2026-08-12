@@ -85,6 +85,9 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  linkedWorkCompletionCallbackUrl: string | undefined;
+  linkedWorkCompletionCallbackSecret: string | undefined;
+  linkedWorkCompletionControlSecret: string | undefined;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
 }
@@ -285,6 +288,36 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
+  const linkedWorkCompletionCallbackUrl = parseLinkedWorkCompletionCallbackUrl(
+    process.env.PAPERCLIP_LINKED_WORK_CALLBACK_URL,
+  );
+  const linkedWorkCompletionCallbackSecret =
+    process.env.PAPERCLIP_LINKED_WORK_CALLBACK_SECRET?.trim() || undefined;
+  if (Boolean(linkedWorkCompletionCallbackUrl) !== Boolean(linkedWorkCompletionCallbackSecret)) {
+    throw new Error(
+      "PAPERCLIP_LINKED_WORK_CALLBACK_URL and PAPERCLIP_LINKED_WORK_CALLBACK_SECRET must be configured together.",
+    );
+  }
+  if (linkedWorkCompletionCallbackSecret && linkedWorkCompletionCallbackSecret.length < 32) {
+    throw new Error("PAPERCLIP_LINKED_WORK_CALLBACK_SECRET must be at least 32 characters.");
+  }
+  const linkedWorkCompletionControlSecret =
+    process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET?.trim() || undefined;
+  if (linkedWorkCompletionControlSecret && linkedWorkCompletionControlSecret.length < 32) {
+    throw new Error("PAPERCLIP_LINKED_WORK_CONTROL_SECRET must be at least 32 characters.");
+  }
+  if (
+    new Set([
+      Boolean(linkedWorkCompletionCallbackUrl),
+      Boolean(linkedWorkCompletionCallbackSecret),
+      Boolean(linkedWorkCompletionControlSecret),
+    ]).size !== 1
+  ) {
+    throw new Error(
+      "PAPERCLIP_LINKED_WORK_CALLBACK_URL, PAPERCLIP_LINKED_WORK_CALLBACK_SECRET, and PAPERCLIP_LINKED_WORK_CONTROL_SECRET must be configured together.",
+    );
+  }
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -331,7 +364,27 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    linkedWorkCompletionCallbackUrl,
+    linkedWorkCompletionCallbackSecret,
+    linkedWorkCompletionControlSecret,
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
+}
+
+function parseLinkedWorkCompletionCallbackUrl(raw: string | undefined): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  const parsed = new URL(value);
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.pathname !== "/integrations/paperclip/linked-work/completion"
+  ) {
+    throw new Error("PAPERCLIP_LINKED_WORK_CALLBACK_URL is not the exact supported completion route.");
+  }
+  return parsed.toString();
 }

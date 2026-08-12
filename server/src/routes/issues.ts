@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -157,6 +157,46 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+function hasLinkedWorkControlSecret(req: Request): boolean {
+  const expected = process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET?.trim();
+  const supplied = req.header("x-paperclip-linked-work-control-secret")?.trim();
+  if (!expected || !supplied) return false;
+  const left = Buffer.from(expected);
+  const right = Buffer.from(supplied);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function sameLinkedWorkCompletion(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function assertLinkedWorkControlPolicy(
+  req: Request,
+  res: Response,
+  policy: { linkedWorkCompletion?: unknown } | null,
+  companyId: string,
+  assigneeAgentId: string | null | undefined,
+): boolean {
+  if (!policy?.linkedWorkCompletion) return true;
+  const completion = policy.linkedWorkCompletion as {
+    originCompanyId: string;
+    targetCompanyId: string;
+    targetAgentId: string;
+  };
+  const trusted = hasLinkedWorkControlSecret(req);
+  if (
+    trusted &&
+    completion.targetCompanyId === companyId &&
+    completion.targetAgentId === assigneeAgentId &&
+    completion.originCompanyId !== companyId
+  ) return true;
+  if (trusted) {
+    res.status(422).json({ error: "Linked-work completion policy does not match the authoritative issue target" });
+    return false;
+  }
+  res.status(403).json({ error: "Linked-work completion policy requires the trusted control capability" });
+  return false;
+}
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
@@ -5160,6 +5200,7 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
+    if (!assertLinkedWorkControlPolicy(req, res, executionPolicy, companyId, createBody.assigneeAgentId)) return;
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
@@ -5322,6 +5363,7 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
+    if (!assertLinkedWorkControlPolicy(req, res, executionPolicy, parent.companyId, createBody.assigneeAgentId)) return;
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
@@ -5494,6 +5536,7 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(child.executionPolicy),
         actor.actorType,
       );
+      if (!assertLinkedWorkControlPolicy(req, res, executionPolicy, sourceIssue.companyId, child.assigneeAgentId)) return;
       await assertCanManageIssueMonitor(access, req, sourceIssue.companyId, child.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
       const childIssueId = randomUUID();
       const sourceTrust = await sourceTrustForActorWrite({
@@ -5915,6 +5958,15 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    if (
+      !sameLinkedWorkCompletion(
+        previousExecutionPolicy?.linkedWorkCompletion,
+        nextExecutionPolicy?.linkedWorkCompletion,
+      )
+    ) {
+      res.status(409).json({ error: "Linked-work completion policy is immutable after issue creation" });
+      return;
+    }
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }

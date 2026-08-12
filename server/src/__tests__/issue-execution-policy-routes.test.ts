@@ -65,11 +65,11 @@ function registerModuleMocks() {
         companyId: "company-1",
         permissions: null,
       })),
-      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
+      resolveByReference: vi.fn(async (companyId: string, reference: string) => ({
         ambiguous: false,
         agent: {
           id: reference,
-          companyId: "company-1",
+          companyId,
           status: "idle",
           orgChainHealth: { status: "healthy" },
         },
@@ -559,6 +559,77 @@ describe("issue execution policy routes", () => {
         }),
       }),
     );
+  });
+
+  it("requires the narrow control capability to create an exact linked-work policy and then makes it immutable", async () => {
+    const companyId = "11111111-1111-4111-8111-111111111111";
+    const agentId = "33333333-3333-4333-8333-333333333333";
+    const secret = "linked-work-control-secret-32-bytes-minimum";
+    const completion = {
+      schemaVersion: "cross-org-linked-work.target.v1",
+      linkedWorkId: "linked_work_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      correlationId: "cross_org_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      originCompanyId: "22222222-2222-4222-8222-222222222222",
+      originIssueId: "44444444-4444-4444-8444-444444444444",
+      targetCompanyId: companyId,
+      targetAgentId: agentId,
+    } as const;
+    const parent = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId,
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-2001",
+      title: "Parent issue",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(parent);
+    const prior = process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET;
+    process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET = secret;
+    try {
+      const denied = await request(await createApp())
+        .post(`/api/issues/${parent.id}/children`)
+        .send({ title: "Denied linked child", assigneeAgentId: agentId, executionPolicy: { linkedWorkCompletion: completion } });
+      expect(denied.status).toBe(403);
+      expect(mockIssueService.createChild).not.toHaveBeenCalled();
+
+      const mismatched = await request(await createApp())
+        .post(`/api/issues/${parent.id}/children`)
+        .set("x-paperclip-linked-work-control-secret", secret)
+        .send({ title: "Mismatched linked child", assigneeAgentId: agentId, executionPolicy: { linkedWorkCompletion: { ...completion, targetAgentId: "55555555-5555-4555-8555-555555555555" } } });
+      expect(mismatched.status).toBe(422);
+      expect(mockIssueService.createChild).not.toHaveBeenCalled();
+
+      const accepted = await request(await createApp())
+        .post(`/api/issues/${parent.id}/children`)
+        .set("x-paperclip-linked-work-control-secret", secret)
+        .send({ title: "Governed linked child", assigneeAgentId: agentId, executionPolicy: { linkedWorkCompletion: completion } });
+      expect(accepted.status).toBe(201);
+      expect(mockIssueService.createChild).toHaveBeenCalledWith(
+        parent.id,
+        expect.objectContaining({ executionPolicy: expect.objectContaining({ linkedWorkCompletion: completion }) }),
+      );
+
+      const stored = {
+        ...parent,
+        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        executionPolicy: normalizeIssueExecutionPolicy({ linkedWorkCompletion: completion }),
+      };
+      mockIssueService.getById.mockResolvedValue(stored);
+      mockIssueService.update.mockClear();
+      const rebind = await request(await createApp())
+        .patch(`/api/issues/${stored.id}`)
+        .set("x-paperclip-linked-work-control-secret", secret)
+        .send({ executionPolicy: { linkedWorkCompletion: { ...completion, originIssueId: "66666666-6666-4666-8666-666666666666" } } });
+      expect(rebind.status).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    } finally {
+      if (prior === undefined) delete process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET;
+      else process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET = prior;
+    }
   });
 
   it("rejects child monitor scheduling by a non-assignee agent even with task assignment permission", async () => {

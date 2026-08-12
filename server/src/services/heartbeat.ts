@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -12,6 +12,7 @@ import {
   envBindingSchema,
   isAgentStatusInvokable,
   isEnvironmentDriverSupportedForAdapter,
+  linkedWorkCompletionPolicySchema,
   type BillingType,
   type EnvironmentLeaseStatus,
   type ExecutionWorkspace,
@@ -41,6 +42,7 @@ import {
   issueDocuments,
   heartbeatRunEvents,
   heartbeatRuns,
+  linkedWorkCompletionOutbox,
   issueApprovals,
   issueComments,
   issuePlanDecompositions,
@@ -3515,9 +3517,17 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  linkedWorkCompletionConfigured?: boolean;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const linkedWorkCompletionConfigured =
+    options.linkedWorkCompletionConfigured ??
+    Boolean(
+      process.env.PAPERCLIP_LINKED_WORK_CALLBACK_URL?.trim() &&
+        process.env.PAPERCLIP_LINKED_WORK_CALLBACK_SECRET?.trim() &&
+        process.env.PAPERCLIP_LINKED_WORK_CONTROL_SECRET?.trim(),
+    );
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -5206,6 +5216,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
           executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
           startedAt: issues.startedAt,
         })
         .from(issues)
@@ -5359,6 +5370,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!finalizedRun) {
         throw new Error("Paperclip adapter disposition lost its run finalization fence.");
+      }
+      if (disposition.kind === "done") {
+        const completion = parseLinkedWorkCompletionPolicy(
+          current.executionPolicy,
+          binding,
+        );
+        if (completion) {
+          if (!linkedWorkCompletionConfigured) {
+            throw new Error(
+              "Linked-work completion delivery is not configured on this Paperclip instance.",
+            );
+          }
+          const providerEventId = linkedWorkCompletionProviderEventId(binding);
+          const identityHash = linkedWorkCompletionIdentityHash({
+            providerEventId,
+            ...completion,
+            companyId: binding.companyId,
+            issueId: binding.issueId,
+            agentId: binding.agentId,
+            runId: binding.runId,
+            evidenceSha256: disposition.evidenceSha256,
+          });
+          await tx
+            .insert(linkedWorkCompletionOutbox)
+            .values({
+              providerEventId,
+              identityHash,
+              companyId: binding.companyId,
+              issueId: binding.issueId,
+              agentId: binding.agentId,
+              runId: binding.runId,
+              linkedWorkId: completion.linkedWorkId,
+              correlationId: completion.correlationId,
+              originCompanyId: completion.originCompanyId,
+              originIssueId: completion.originIssueId,
+              evidenceSha256: disposition.evidenceSha256,
+            })
+            .onConflictDoNothing({ target: linkedWorkCompletionOutbox.providerEventId });
+          const durable = await tx
+            .select({ identityHash: linkedWorkCompletionOutbox.identityHash })
+            .from(linkedWorkCompletionOutbox)
+            .where(eq(linkedWorkCompletionOutbox.providerEventId, providerEventId))
+            .then((rows) => rows[0] ?? null);
+          if (!durable || durable.identityHash !== identityHash) {
+            throw new Error("Linked-work completion outbox identity conflict.");
+          }
+        }
       }
       await tx.insert(activityLog).values({
         companyId: binding.companyId,
@@ -12778,4 +12836,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return run ?? null;
     },
   };
+}
+
+interface LinkedWorkCompletionPolicy {
+  linkedWorkId: string;
+  correlationId: string;
+  originCompanyId: string;
+  originIssueId: string;
+}
+
+function parseLinkedWorkCompletionPolicy(
+  executionPolicy: unknown,
+  binding: { runId: string; companyId: string; agentId: string; issueId: string },
+): LinkedWorkCompletionPolicy | null {
+  if (!executionPolicy || typeof executionPolicy !== "object" || Array.isArray(executionPolicy)) {
+    return null;
+  }
+  const raw = (executionPolicy as Record<string, unknown>).linkedWorkCompletion;
+  if (raw === undefined) return null;
+  const parsed = linkedWorkCompletionPolicySchema.safeParse(raw);
+  if (
+    !parsed.success ||
+    parsed.data.targetCompanyId !== binding.companyId ||
+    parsed.data.targetAgentId !== binding.agentId
+  ) {
+    throw new Error("Linked-work completion policy does not match the authoritative target binding.");
+  }
+  return {
+    linkedWorkId: parsed.data.linkedWorkId,
+    correlationId: parsed.data.correlationId,
+    originCompanyId: parsed.data.originCompanyId,
+    originIssueId: parsed.data.originIssueId,
+  };
+}
+
+function linkedWorkCompletionProviderEventId(binding: {
+  runId: string;
+  companyId: string;
+  agentId: string;
+  issueId: string;
+}): string {
+  return `linked-work-completion-v1:${createHash("sha256")
+    .update(`${binding.companyId}\n${binding.issueId}\n${binding.agentId}\n${binding.runId}`)
+    .digest("hex")}`;
+}
+
+function linkedWorkCompletionIdentityHash(input: Record<string, string>): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify(
+        Object.fromEntries(
+          Object.entries(input).sort(([left], [right]) => left.localeCompare(right)),
+        ),
+      ),
+    )
+    .digest("hex");
 }

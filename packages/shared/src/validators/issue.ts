@@ -195,6 +195,18 @@ export const issueExecutionMonitorPolicySchema = z.object({
   recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).optional().nullable().default(null),
 });
 
+export const linkedWorkCompletionPolicySchema = z
+  .object({
+    schemaVersion: z.literal("cross-org-linked-work.target.v1"),
+    linkedWorkId: z.string().regex(/^linked_work_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u),
+    correlationId: z.string().regex(/^cross_org_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u),
+    originCompanyId: z.string().uuid(),
+    originIssueId: z.string().uuid(),
+    targetCompanyId: z.string().uuid(),
+    targetAgentId: z.string().uuid(),
+  })
+  .strict();
+
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
@@ -202,6 +214,7 @@ export const issueExecutionPolicySchema = z.object({
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  linkedWorkCompletion: linkedWorkCompletionPolicySchema.optional(),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
