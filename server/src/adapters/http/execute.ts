@@ -1,5 +1,8 @@
 import type { AdapterExecutionContext, AdapterExecutionResult } from "../types.js";
 import { asString, asNumber, parseObject } from "../utils.js";
+import { readPaperclipAdapterDispositionResponse } from "./disposition.js";
+
+const DISPOSITION_CONTRACT = "paperclip.adapter-disposition.v1";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { config, runId, agent, context } = ctx;
@@ -28,6 +31,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!res.ok) {
       throw new Error(`HTTP invoke failed with status ${res.status}`);
+    }
+
+    const dispositionContract = res.headers.get("x-paperclip-adapter-contract");
+    if (dispositionContract !== null && dispositionContract !== DISPOSITION_CONTRACT) {
+      throw new Error("HTTP adapter returned an unsupported disposition contract version");
+    }
+    if (dispositionContract === DISPOSITION_CONTRACT) {
+      const issueId = asString(context.issueId, "");
+      if (!issueId) {
+        throw new Error("HTTP adapter disposition contract requires an issue binding");
+      }
+      const disposition = await readPaperclipAdapterDispositionResponse(res, {
+        runId,
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId,
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: disposition.disposition.summary,
+        resultJson: {
+          paperclipAdapterDisposition: disposition,
+          ...(disposition.disposition.kind === "continue"
+            ? { nextAction: disposition.disposition.summary }
+            : {}),
+        },
+      };
     }
 
     return {

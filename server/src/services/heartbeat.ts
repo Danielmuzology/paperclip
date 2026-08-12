@@ -66,6 +66,7 @@ import type {
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
+import { paperclipAdapterDispositionEnvelopeSchema } from "../adapters/http/disposition.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
@@ -5170,6 +5171,242 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  async function finalizeRunWithPaperclipAdapterDisposition(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    issueId: string | null;
+    disposition: import("../adapters/http/disposition.js").PaperclipAdapterDispositionEnvelope;
+    status: string;
+    patch: Partial<typeof heartbeatRuns.$inferInsert>;
+  }): Promise<{
+    run: typeof heartbeatRuns.$inferSelect | null;
+    updated: boolean;
+  }> {
+    const binding = input.disposition.binding;
+    if (
+      !input.issueId ||
+      binding.runId !== input.run.id ||
+      binding.companyId !== input.run.companyId ||
+      binding.agentId !== input.run.agentId ||
+      binding.issueId !== input.issueId ||
+      input.agent.id !== input.run.agentId ||
+      input.agent.companyId !== input.run.companyId
+    ) {
+      throw new Error("Paperclip adapter disposition binding changed before application.");
+    }
+
+    const result = await db.transaction(async (tx) => {
+      const current = await tx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId!), eq(issues.companyId, input.run.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const liveRun = await tx
+        .select({
+          id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.run.id))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !current ||
+        !liveRun ||
+        liveRun.status !== "running" ||
+        liveRun.companyId !== binding.companyId ||
+        liveRun.agentId !== binding.agentId ||
+        current.assigneeAgentId !== binding.agentId ||
+        current.executionRunId !== binding.runId ||
+        current.companyId !== binding.companyId ||
+        current.id !== binding.issueId ||
+        (current.status !== "todo" && current.status !== "in_progress")
+      ) {
+        return { run: liveRun, updated: false as const };
+      }
+
+      const patch: Partial<typeof issues.$inferInsert> = {};
+      const disposition = input.disposition.disposition;
+      if (disposition.kind === "done") {
+        patch.status = "done";
+        patch.completedAt = new Date();
+        patch.executionState = null;
+        patch.checkoutRunId = null;
+        patch.executionRunId = null;
+        patch.executionAgentNameKey = null;
+        patch.executionLockedAt = null;
+      } else if (disposition.kind === "blocked") {
+        const blocker = await tx
+          .select({ id: issues.id, status: issues.status })
+          .from(issueRelations)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.id, issueRelations.issueId),
+              eq(issues.companyId, issueRelations.companyId),
+            ),
+          )
+          .where(
+            and(
+              eq(issueRelations.companyId, binding.companyId),
+              eq(issueRelations.type, "blocks"),
+              eq(issueRelations.issueId, disposition.blockerIssueId),
+              eq(issueRelations.relatedIssueId, binding.issueId),
+              notInArray(issues.status, ["done", "cancelled"]),
+              isNull(issues.hiddenAt),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (!blocker) {
+          throw new Error(
+            "Paperclip adapter blocked disposition is not backed by the exact active blocker.",
+          );
+        }
+        patch.status = "blocked";
+        patch.checkoutRunId = null;
+        patch.executionRunId = null;
+        patch.executionAgentNameKey = null;
+        patch.executionLockedAt = null;
+      } else if (disposition.kind === "in_review") {
+        const reviewer = await tx
+          .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+          .from(agents)
+          .where(
+            and(
+              eq(agents.id, disposition.reviewerAgentId),
+              eq(agents.companyId, input.run.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        const existingState = current.executionState;
+        const existingParticipant =
+          existingState && typeof existingState === "object"
+            ? (existingState as Record<string, unknown>).currentParticipant
+            : null;
+        const participant =
+          existingParticipant && typeof existingParticipant === "object"
+            ? (existingParticipant as Record<string, unknown>)
+            : null;
+        if (
+          !reviewer ||
+          ["terminated", "pending_approval"].includes(reviewer.status) ||
+          participant?.type !== "agent" ||
+          participant.agentId !== reviewer.id
+        ) {
+          throw new Error("Paperclip adapter disposition reviewer is not authorized.");
+        }
+        patch.status = "in_review";
+        patch.assigneeAgentId = reviewer.id;
+        patch.assigneeUserId = null;
+        patch.checkoutRunId = null;
+        patch.executionRunId = null;
+        patch.executionAgentNameKey = null;
+        patch.executionLockedAt = null;
+        // Preserve the pre-existing governed review path verbatim. An HTTP
+        // adapter response is never allowed to invent review stages/owners.
+        patch.executionState = current.executionState;
+      } else {
+        // An explicit continuation intentionally keeps the issue in progress.
+        // The bounded `nextAction` in resultJson drives the existing continuation
+        // scheduler after this exact run reaches a successful terminal state.
+        patch.status = "in_progress";
+      }
+      const updatedIssue = await tx
+        .update(issues)
+        .set({ ...patch, updatedAt: new Date() })
+        .where(
+          and(
+            eq(issues.id, binding.issueId),
+            eq(issues.companyId, binding.companyId),
+            eq(issues.assigneeAgentId, binding.agentId),
+            eq(issues.executionRunId, binding.runId),
+            inArray(issues.status, ["todo", "in_progress"]),
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      if (!updatedIssue) {
+        return { run: liveRun, updated: false as const };
+      }
+      const finalizedRun = await tx
+        .update(heartbeatRuns)
+        .set({ status: input.status, ...input.patch, updatedAt: new Date() })
+        .where(
+          and(
+            eq(heartbeatRuns.id, binding.runId),
+            eq(heartbeatRuns.companyId, binding.companyId),
+            eq(heartbeatRuns.agentId, binding.agentId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!finalizedRun) {
+        throw new Error("Paperclip adapter disposition lost its run finalization fence.");
+      }
+      await tx.insert(activityLog).values({
+        companyId: binding.companyId,
+        actorType: "agent",
+        actorId: binding.agentId,
+        agentId: binding.agentId,
+        runId: binding.runId,
+        action: "issue.paperclip_adapter_disposition_applied",
+        entityType: "issue",
+        entityId: binding.issueId,
+        details: {
+          schemaVersion: input.disposition.schemaVersion,
+          disposition: disposition.kind,
+          evidenceSha256: disposition.evidenceSha256,
+          ...(disposition.kind === "blocked"
+            ? { blockerIssueId: disposition.blockerIssueId }
+            : {}),
+          ...(disposition.kind === "in_review"
+            ? { reviewerAgentId: disposition.reviewerAgentId }
+            : {}),
+        },
+      });
+      return { run: finalizedRun, updated: true as const };
+    });
+    if (!result.updated) {
+      throw new Error("Paperclip adapter disposition lost its active run fence.");
+    }
+    if (result.run) {
+      clearHeartbeatRunRuntimeStatus(result.run.id);
+      publishLiveEvent({
+        companyId: result.run.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: result.run.id,
+          agentId: result.run.agentId,
+          status: result.run.status,
+          invocationSource: result.run.invocationSource,
+          triggerDetail: result.run.triggerDetail,
+          error: result.run.error ?? null,
+          errorCode: result.run.errorCode ?? null,
+          startedAt: result.run.startedAt
+            ? new Date(result.run.startedAt).toISOString()
+            : null,
+          finishedAt: result.run.finishedAt
+            ? new Date(result.run.finishedAt).toISOString()
+            : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(result.run);
+    }
+    return result;
+  }
+
   async function setWakeupStatus(
     wakeupRequestId: string | null | undefined,
     status: string,
@@ -9771,6 +10008,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       }
+      const adapterDisposition =
+        adapterResult.resultJson?.paperclipAdapterDisposition === undefined
+          ? null
+          : paperclipAdapterDispositionEnvelopeSchema.parse(
+              adapterResult.resultJson.paperclipAdapterDisposition,
+            );
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -9927,7 +10170,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
-      const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
+      const persistedRunWrite =
+        adapterDisposition && outcome === "succeeded"
+          ? await finalizeRunWithPaperclipAdapterDisposition({
+              run,
+              agent,
+              issueId,
+              disposition: adapterDisposition,
+              status,
+              patch: {
+                finishedAt: new Date(),
+                error: runErrorMessage,
+                errorCode: runErrorCode,
+                exitCode: adapterResult.exitCode,
+                signal: adapterResult.signal,
+                usageJson,
+                resultJson: persistedResultJson,
+                sessionIdAfter:
+                  nextSessionState.displayId ?? nextSessionState.legacySessionId,
+                stdoutExcerpt,
+                stderrExcerpt,
+                logBytes: logSummary?.bytes,
+                logSha256: logSummary?.sha256,
+                logCompressed: logSummary?.compressed ?? false,
+              },
+            })
+          : await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
         errorCode: runErrorCode,

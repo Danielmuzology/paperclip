@@ -949,6 +949,183 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
 
+  it.each(["done", "blocked", "continue", "in_review"] as const)(
+    "atomically applies a strict bound HTTP adapter %s disposition once",
+    async (kind) => {
+      const { companyId, agentId, runId, issueId } =
+        await seedQueuedIssueRunFixture();
+      const blockerIssueId = randomUUID();
+      const reviewerAgentId = randomUUID();
+      if (kind === "blocked") {
+        await db.insert(issues).values({
+          id: blockerIssueId,
+          companyId,
+          title: "Governed blocker",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 2,
+          identifier: `B-${blockerIssueId.slice(0, 8)}`,
+          startedAt: new Date(),
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          type: "blocks",
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+        });
+      }
+      if (kind === "in_review") {
+        await db.insert(agents).values({
+          id: reviewerAgentId,
+          companyId,
+          name: "GovernedReviewer",
+          role: "reviewer",
+          status: "idle",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+        await db
+          .update(issues)
+          .set({
+            executionState: {
+              currentParticipant: {
+                type: "agent",
+                agentId: reviewerAgentId,
+                userId: null,
+              },
+            } as never,
+          })
+          .where(eq(issues.id, issueId));
+      }
+      const disposition = {
+        kind,
+        summary: `${kind} disposition accepted.`,
+        evidenceSha256: "a".repeat(64),
+        ...(kind === "blocked" ? { blockerIssueId } : {}),
+        ...(kind === "in_review" ? { reviewerAgentId } : {}),
+      };
+      mockAdapterExecute.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: disposition.summary,
+        resultJson: {
+          paperclipAdapterDisposition: {
+            schemaVersion: "paperclip.adapter-disposition.v1",
+            status: "completed",
+            binding: { runId, companyId, agentId, issueId },
+            disposition,
+          },
+          ...(kind === "continue" ? { nextAction: disposition.summary } : {}),
+        },
+      });
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.resumeQueuedRuns();
+      const settled = await waitForRunToSettle(heartbeat, runId, 5_000);
+
+      expect(settled?.status).toBe("succeeded");
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe(kind === "continue" ? "in_progress" : kind);
+      if (kind === "in_review") {
+        expect(issue?.assigneeAgentId).toBe(reviewerAgentId);
+      }
+      if (kind !== "continue") {
+        expect(issue?.executionRunId).toBeNull();
+      }
+      const dispositionActivity = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.runId, runId),
+            eq(activityLog.action, "issue.paperclip_adapter_disposition_applied"),
+          ),
+        );
+      expect(dispositionActivity).toHaveLength(1);
+      expect(dispositionActivity[0]?.details).toMatchObject({
+        disposition: kind,
+        evidenceSha256: "a".repeat(64),
+      });
+
+      await heartbeat.resumeQueuedRuns();
+      expect(
+        await db
+          .select()
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.runId, runId),
+              eq(
+                activityLog.action,
+                "issue.paperclip_adapter_disposition_applied",
+              ),
+            ),
+          ),
+      ).toHaveLength(1);
+    },
+    15_000,
+  );
+
+  it("fails a mismatched HTTP adapter disposition without mutating the issue", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedQueuedIssueRunFixture();
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "Must not apply.",
+      resultJson: {
+        paperclipAdapterDisposition: {
+          schemaVersion: "paperclip.adapter-disposition.v1",
+          status: "completed",
+          binding: {
+            runId,
+            companyId,
+            agentId,
+            issueId: randomUUID(),
+          },
+          disposition: {
+            kind: "done",
+            summary: "Must not apply.",
+            evidenceSha256: "b".repeat(64),
+          },
+        },
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settled = await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    expect(settled?.status).toBe("failed");
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBe(runId);
+    expect(
+      await db
+        .select()
+        .from(activityLog)
+        .where(
+          eq(
+            activityLog.action,
+            "issue.paperclip_adapter_disposition_applied",
+          ),
+        ),
+    ).toHaveLength(0);
+  });
+
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
