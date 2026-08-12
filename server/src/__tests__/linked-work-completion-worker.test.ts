@@ -126,6 +126,63 @@ describePg("linked-work completion worker", () => {
     expect((await db.select().from(linkedWorkCompletionOutbox).where(eq(linkedWorkCompletionOutbox.providerEventId, row.providerEventId)))[0]).toMatchObject({ status: "delivered", attemptCount: 1, leaseFence: 1 });
   });
 
+  it("does not POST after authority expires during preflight and lets recovery send once", async () => {
+    const claimedAt = new Date("2026-08-12T12:00:00.000Z");
+    const expiredAt = new Date(claimedAt.getTime() + 60_001);
+    const row = await seed({ nextAttemptAt: claimedAt });
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(ack(row));
+    let clockReads = 0;
+    const stale = createLinkedWorkCompletionWorker(
+      db,
+      {
+        callbackUrl:
+          "https://origin.example.test/integrations/paperclip/linked-work/completion",
+        callbackSecret: "x".repeat(32),
+      },
+      {
+        fetchFn,
+        now: () => (clockReads++ === 0 ? claimedAt : expiredAt),
+      },
+    );
+
+    expect(await stale.processNext()).toBe(true);
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(
+      (
+        await db
+          .select()
+          .from(linkedWorkCompletionOutbox)
+          .where(eq(linkedWorkCompletionOutbox.providerEventId, row.providerEventId))
+      )[0],
+    ).toMatchObject({
+      status: "processing",
+      sendStarted: false,
+      attemptCount: 1,
+      leaseFence: 1,
+    });
+
+    const recovered = createLinkedWorkCompletionWorker(
+      db,
+      {
+        callbackUrl:
+          "https://origin.example.test/integrations/paperclip/linked-work/completion",
+        callbackSecret: "x".repeat(32),
+      },
+      { fetchFn, now: () => expiredAt },
+    );
+    expect(await recovered.recoverExpired()).toEqual({ released: 1, quarantined: 0 });
+    expect(await recovered.processNext()).toBe(true);
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(
+      (
+        await db
+          .select()
+          .from(linkedWorkCompletionOutbox)
+          .where(eq(linkedWorkCompletionOutbox.providerEventId, row.providerEventId))
+      )[0],
+    ).toMatchObject({ status: "delivered", attemptCount: 2, leaseFence: 2 });
+  });
+
   it("retries the same deterministic event after an ambiguous accept and after 429 backoff", async () => {
     let clock = new Date("2026-08-12T12:00:00.000Z");
     const row = await seed({ nextAttemptAt: clock });

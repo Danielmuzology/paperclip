@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, eq, lte, sql } from "drizzle-orm";
+import { and, eq, gt, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   heartbeatRuns,
@@ -148,41 +148,61 @@ export function createLinkedWorkCompletionWorker(
     });
     if (!claimed) return false;
 
-    const fence = and(
+    const baseFence = and(
       eq(linkedWorkCompletionOutbox.providerEventId, claimed.providerEventId),
       eq(linkedWorkCompletionOutbox.status, "processing"),
       eq(linkedWorkCompletionOutbox.leaseOwner, owner),
       eq(linkedWorkCompletionOutbox.leaseFence, claimed.leaseFence),
       eq(linkedWorkCompletionOutbox.leaseTokenHash, tokenHash),
     );
+    const liveFence = (at: Date) =>
+      and(baseFence, gt(linkedWorkCompletionOutbox.leaseExpiresAt, at));
     try {
       const authoritative = await loadAuthoritativeCompletion(db, claimed);
       if (!authoritative) {
+        const transitionAt = now();
         await markManual(
           db,
-          fence,
-          instant,
+          liveFence(transitionAt),
+          transitionAt,
           "completion_binding_mismatch",
           "Durable completion no longer matches the authoritative issue and run.",
         );
         return true;
       }
+      const sendStartedAt = now();
       const marked = await db
         .update(linkedWorkCompletionOutbox)
-        .set({ sendStarted: true, updatedAt: now() })
-        .where(fence)
+        .set({ sendStarted: true, updatedAt: sendStartedAt })
+        .where(liveFence(sendStartedAt))
         .returning({ id: linkedWorkCompletionOutbox.providerEventId });
       if (marked.length !== 1) throw new Error("Completion delivery lease was lost.");
 
       const response = await postCallback(fetchFn, config, claimed);
       if (response.kind === "manual") {
-        await markManual(db, fence, now(), response.code, response.summary);
+        const transitionAt = now();
+        await markManual(
+          db,
+          liveFence(transitionAt),
+          transitionAt,
+          response.code,
+          response.summary,
+        );
         return true;
       }
       if (response.kind === "retry") {
-        await markRetry(db, fence, claimed, now(), response.code, response.summary);
+        const transitionAt = now();
+        await markRetry(
+          db,
+          liveFence(transitionAt),
+          claimed,
+          transitionAt,
+          response.code,
+          response.summary,
+        );
         return true;
       }
+      const deliveredAt = now();
       const delivered = await db
         .update(linkedWorkCompletionOutbox)
         .set({
@@ -190,12 +210,12 @@ export function createLinkedWorkCompletionWorker(
           leaseOwner: null,
           leaseTokenHash: null,
           leaseExpiresAt: null,
-          deliveredAt: now(),
-          updatedAt: now(),
+          deliveredAt,
+          updatedAt: deliveredAt,
           lastErrorCode: null,
           lastErrorSummary: null,
         })
-        .where(fence)
+        .where(liveFence(deliveredAt))
         .returning({ id: linkedWorkCompletionOutbox.providerEventId });
       if (delivered.length !== 1) {
         throw new Error("Completion delivery acknowledgement lost its durable fence.");
@@ -203,7 +223,15 @@ export function createLinkedWorkCompletionWorker(
       return true;
     } catch (error) {
       try {
-        await markRetry(db, fence, claimed, now(), "callback_outcome_ambiguous_retry", "The deterministic callback event will be retried after an ambiguous outcome.");
+        const transitionAt = now();
+        await markRetry(
+          db,
+          liveFence(transitionAt),
+          claimed,
+          transitionAt,
+          "callback_outcome_ambiguous_retry",
+          "The deterministic callback event will be retried after an ambiguous outcome.",
+        );
       } catch {
         // The durable lease/state fence is authoritative if another recovery won.
       }
