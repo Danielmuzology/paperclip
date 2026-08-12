@@ -5269,6 +5269,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               isNull(issues.hiddenAt),
             ),
           )
+          .for("update")
           .then((rows) => rows[0] ?? null);
         if (!blocker) {
           throw new Error(
@@ -5290,6 +5291,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agents.companyId, input.run.companyId),
             ),
           )
+          .for("update")
           .then((rows) => rows[0] ?? null);
         const existingState = current.executionState;
         const existingParticipant =
