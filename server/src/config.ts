@@ -375,7 +375,14 @@ export function loadConfig(): Config {
 function parseLinkedWorkCompletionCallbackUrl(raw: string | undefined): string | undefined {
   const value = raw?.trim();
   if (!value) return undefined;
-  const parsed = new URL(value);
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(
+      "PAPERCLIP_LINKED_WORK_CALLBACK_URL is not the exact supported completion route.",
+    );
+  }
   if (
     !["http:", "https:"].includes(parsed.protocol) ||
     parsed.username ||

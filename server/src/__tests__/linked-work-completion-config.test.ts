@@ -60,6 +60,7 @@ describe("linked-work completion config", () => {
   });
 
   it.each([
+    "not-a-url-with-password=must-not-be-reflected",
     "ftp://origin.example.test/integrations/paperclip/linked-work/completion",
     "https://user:password@origin.example.test/integrations/paperclip/linked-work/completion",
     "https://origin.example.test/integrations/paperclip/linked-work/completion?next=1",
